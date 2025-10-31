@@ -45,9 +45,15 @@ func TestInsert(t *testing.T) {
 	conf := clickhouse.DefaultConfiguration()
 	conf.MaximumBatchSize = 10
 	conf.MaximumWaitTime = time.Second
-	ch, err := clickhouse.New(r, conf, clickhouse.Dependencies{
-		ClickHouse: chdb,
-		Schema:     sch,
+	ch, err := clickhouse.New(r, clickhouse.Dependencies{
+		Schema: sch,
+		Destinations: []clickhouse.DestinationDependency{
+			{
+				Name:       "primary",
+				ClickHouse: chdb,
+				Config:     conf,
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("clickhouse.New() error:\n%+v", err)
@@ -207,9 +213,15 @@ func TestMultipleServers(t *testing.T) {
 		helpers.StartStop(t, chdb)
 		conf := clickhouse.DefaultConfiguration()
 		conf.MaximumBatchSize = 10
-		ch, err := clickhouse.New(r, conf, clickhouse.Dependencies{
-			ClickHouse: chdb,
-			Schema:     sch,
+		ch, err := clickhouse.New(r, clickhouse.Dependencies{
+			Schema: sch,
+			Destinations: []clickhouse.DestinationDependency{
+				{
+					Name:       "primary",
+					ClickHouse: chdb,
+					Config:     conf,
+				},
+			},
 		})
 		if err != nil {
 			t.Fatalf("clickhouse.New() error:\n%+v", err)

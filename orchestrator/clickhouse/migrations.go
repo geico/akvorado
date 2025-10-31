@@ -17,6 +17,12 @@ import (
 func (c *Component) migrateDatabase() error {
 	ctx := c.t.Context(nil)
 
+	// Skip schema management if disabled
+	if !c.config.ManageSchema {
+		c.r.Info().Msg("ClickHouse schema management disabled, skipping migrations")
+		return nil
+	}
+
 	// Set orchestrator URL
 	if c.config.OrchestratorURL == "" {
 		baseURL, err := c.guessHTTPBaseURL("1.1.1.1")

@@ -612,13 +612,119 @@ The ClickHouse component pushes data to ClickHouse. There are two settings that
 are configurable:
 
 - `maximum-batch-size` defines how many flows to send to ClickHouse in a single batch at most
-- `minimum-wait-time` defines how long to wait before sending an incomplete batch
+- `maximum-wait-time` defines how long to wait before sending an incomplete batch
 
 These numbers are per-worker (as defined in the Kafka component). A worker will
 send a batch of size at most `maximum-batch-size` at least every
 `maximum-wait-time`. ClickHouse is more efficient when the batch size is large.
-The default value is 100 000 and allows ClickHouse to handle incoming flows
+The default value is 100 000 and allows ClickHouse to handle incoming flows
 efficiently.
+
+#### Dual-Write to Multiple ClickHouse Destinations
+
+The outlet can write flow data to multiple ClickHouse destinations simultaneously.
+This is useful for:
+
+- **Disaster recovery**: Write to both local and remote ClickHouse instances
+- **Data replication**: Maintain copies in different datacenters
+- **Centralized observability**: Send data to a central ClickHouse while keeping local copies
+
+The configuration uses a default ClickHouse behavior that applies to all
+destinations, with optional per-destination overrides. The primary destination
+(configured via `clickhousedb`) remains backward compatible.
+
+**Example configuration:**
+
+```yaml
+outlet:
+  # Default ClickHouse behavior (applied to all destinations)
+  clickhouse:
+    maximum-batch-size: 50000
+    maximum-wait-time: 5s
+  
+  # Primary destination (backward compatible)
+  clickhousedb:
+    servers: ["127.0.0.1:9000"]
+    database: flows
+    username: default
+  
+  # Additional destinations with optional overrides
+  data-destinations:
+    - name: azure
+      connection:
+        servers: ["azure-ch.example.com:9440"]
+        database: flows
+        username: azure_user
+        password: azure_pass
+        max-retries: 3  # Retry up to 3 times (0 = infinite)
+        tls:
+          enable: true
+          verify: true
+      clickhouse:  # Override default settings for this destination
+        maximum-batch-size: 40000
+        maximum-wait-time: 3s
+    
+    - name: backup
+      connection:
+        servers: ["backup-ch.example.com:9000"]
+        database: flows
+        username: backup_user
+        max-retries: 5
+      # Uses default clickhouse settings (no override)
+```
+
+**Configuration notes:**
+
+- The `clickhouse` section defines default behavior settings applied to all destinations
+- The `clickhousedb` section defines the primary destination (backward compatible)
+- The `data-destinations` section defines additional destinations
+- Each destination can optionally override the default `clickhouse` settings
+- The `max-retries` setting controls retry behavior:
+  - `0` (default): Infinite retries - suitable for primary destination
+  - `> 0`: Maximum number of retries - recommended for additional destinations
+- All destinations write in parallel using Go routines
+- A failure in one destination does not block writes to others
+- Metrics are tracked per destination with a `destination` label
+
+**Orchestrator configuration:**
+
+When using multiple ClickHouse destinations across datacenters, each datacenter
+typically runs its own orchestrator:
+
+- **Primary datacenter orchestrator**: Manages Kafka topic and local ClickHouse schema
+- **Remote datacenter orchestrators**: Only manage their local ClickHouse schema (no Kafka)
+- **Outlet orchestrators** (if separate): Don't manage Kafka or ClickHouse
+
+Example for a remote datacenter orchestrator (manages only its local ClickHouse):
+
+```yaml
+orchestrator:
+  kafka:
+    manage-topic: false  # Kafka managed by primary datacenter
+    # Note: brokers/topic still required but not used (dummy values OK)
+    brokers: ["dummy"]
+    topic: flows
+  clickhouse:
+    manage-schema: true  # Manage local ClickHouse schema
+    resolutions:
+      - interval: 0
+        ttl: 360h
+```
+
+Example for outlet-only orchestrator (manages nothing):
+
+```yaml
+orchestrator:
+  kafka:
+    manage-topic: false
+    # Dummy values - not used when manage-topic is false
+    brokers: ["dummy"]
+    topic: flows
+  clickhouse:
+    manage-schema: false  # Schema managed by dedicated orchestrator
+```
+
+See the [orchestrator configuration](#clickhouse-1) section for more details.
 
 ## Orchestrator service
 
@@ -760,7 +866,21 @@ flows. It accepts the following keys:
 - `tls` defines the TLS configuration to connect to the cluster
 - `sasl` defines the SASL configuration to connect to the cluster
 - `topic` defines the base topic name
+- `manage-topic` controls whether the orchestrator should create/update the Kafka topic (default: `true`)
 - `topic-configuration` describes how the topic should be configured
+
+**Topic management:**
+
+Set `manage-topic: false` when the Kafka topic is managed externally or by
+another orchestrator instance. This is useful in multi-datacenter deployments
+where only one orchestrator should manage the shared Kafka infrastructure:
+
+```yaml
+kafka:
+  brokers: ["kafka:9092"]
+  topic: flows
+  manage-topic: false  # Don't create/update topic
+```
 
 The following keys are accepted for the TLS configuration:
 
@@ -828,6 +948,24 @@ ClickHouse database. The following keys should be provided inside
 - `password` is the password to use for authentication
 - `database` defines the database to use to create tables
 - `cluster` defines the cluster for replicated and distributed tables, see the next section for more information
+- `max-retries` defines the maximum number of retries for failed operations (default: `0` for infinite retries)
+- `tls` defines TLS connection parameters (see below)
+
+**Retry behavior:**
+
+The `max-retries` setting controls how many times to retry failed ClickHouse
+operations before giving up:
+
+- `0` (default): Infinite retries with exponential backoff - suitable for primary destinations
+- `> 0`: Maximum number of retries - recommended for additional destinations to prevent blocking
+
+```yaml
+clickhousedb:
+  servers: ["clickhouse:9000"]
+  database: flows
+  username: default
+  max-retries: 0  # Infinite retries (default)
+```
 
 ### ClickHouse
 
@@ -836,6 +974,7 @@ configure a ClickHouse database. It also provisions and keep
 up-to-date a ClickHouse database. The following keys can be
 provided inside `clickhouse`:
 
+- `manage-schema` controls whether the orchestrator should create/update ClickHouse tables (default: `true`)
 - `resolutions` defines the various resolutions to keep data
 - `max-partitions` defines the number of partitions to use when
   creating consolidated tables
@@ -843,6 +982,21 @@ provided inside `clickhouse`:
   `region`, and `tenant`. They are exposed as `SrcNetName`, `DstNetName`,
   `SrcNetRole`, `DstNetRole`, etc. It is also possible to override GeoIP
   attributes `city`, `state`, `country`, and `ASN`.
+
+**Schema management:**
+
+Set `manage-schema: false` when the ClickHouse schema is managed externally or by
+another orchestrator instance. This is useful when:
+
+- Using multiple ClickHouse destinations (each with its own orchestrator)
+- The schema is managed by a dedicated orchestrator instance
+- You want manual control over schema migrations
+
+```yaml
+clickhouse:
+  manage-schema: false  # Don't create/update tables
+  # Note: resolutions are ignored when manage-schema is false
+```
 - `network-sources` fetch a remote source mapping subnets to attributes. This is
   similar to `networks` but the definition is fetched through HTTP. It accepts a
   map from source names to sources. Each source accepts the following

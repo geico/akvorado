@@ -12,6 +12,7 @@ import (
 
 	"github.com/ClickHouse/ch-go"
 	"github.com/cenkalti/backoff/v4"
+	"golang.org/x/sync/errgroup"
 
 	"akvorado/common/reporter"
 	"akvorado/common/schema"
@@ -43,39 +44,61 @@ type realWorker struct {
 	last   time.Time
 	logger reporter.Logger
 
+	// Per-destination writers (not full workers, just write handlers)
+	destWriters []*destinationWriter
+}
+
+// destinationWriter handles writes to a single ClickHouse destination
+type destinationWriter struct {
+	name          string
 	conn          *ch.Client
 	servers       []string
 	options       ch.Options
 	asyncSettings []ch.Setting
+	config        Configuration
+	maxRetries    int
 }
 
 // NewWorker creates a new worker to push data to ClickHouse.
 func (c *realComponent) NewWorker(i int, bf *schema.FlowMessage) Worker {
-	opts, servers := c.d.ClickHouse.ChGoOptions()
 	w := realWorker{
-		c:      c,
-		bf:     bf,
-		logger: c.r.With().Int("worker", i).Logger(),
-
-		servers: servers,
-		options: opts,
-		asyncSettings: []ch.Setting{
-			{
-				Key:       "async_insert",
-				Value:     "1",
-				Important: true,
-			},
-			{
-				Key:       "wait_for_async_insert",
-				Value:     "1",
-				Important: true,
-			},
-			{
-				Key:   "async_insert_busy_timeout_max_ms",
-				Value: strconv.FormatUint(uint64(c.config.MaximumWaitTime.Milliseconds()), 10),
-			},
-		},
+		c:           c,
+		bf:          bf,
+		logger:      c.r.With().Int("worker", i).Logger(),
+		destWriters: make([]*destinationWriter, 0, len(c.destinations)),
 	}
+
+	// Create a destination writer for each destination
+	for _, dest := range c.destinations {
+		opts, servers := dest.db.ChGoOptions()
+		maxRetries := dest.db.MaxRetries()
+
+		dw := &destinationWriter{
+			name:       dest.name,
+			servers:    servers,
+			options:    opts,
+			config:     dest.config,
+			maxRetries: maxRetries,
+			asyncSettings: []ch.Setting{
+				{
+					Key:       "async_insert",
+					Value:     "1",
+					Important: true,
+				},
+				{
+					Key:       "wait_for_async_insert",
+					Value:     "1",
+					Important: true,
+				},
+				{
+					Key:   "async_insert_busy_timeout_max_ms",
+					Value: strconv.FormatUint(uint64(dest.config.MaximumWaitTime.Milliseconds()), 10),
+				},
+			},
+		}
+		w.destWriters = append(w.destWriters, dw)
+	}
+
 	return &w
 }
 
@@ -89,7 +112,8 @@ func (w *realWorker) FinalizeAndSend(ctx context.Context) WorkerStatus {
 	now := time.Now()
 	batchSize := w.bf.FlowCount()
 	waitTime := now.Sub(w.last)
-	if batchSize >= int(w.c.config.MaximumBatchSize) || waitTime >= w.c.config.MaximumWaitTime {
+	primaryConfig := w.c.primaryConfig()
+	if batchSize >= int(primaryConfig.MaximumBatchSize) || waitTime >= primaryConfig.MaximumWaitTime {
 		// Record wait time since last send
 		if !w.last.IsZero() {
 			waitTime := now.Sub(w.last)
@@ -97,10 +121,10 @@ func (w *realWorker) FinalizeAndSend(ctx context.Context) WorkerStatus {
 		}
 		w.Flush(ctx)
 		w.last = time.Now()
-		if uint(batchSize) >= w.c.config.MaximumBatchSize {
+		if uint(batchSize) >= primaryConfig.MaximumBatchSize {
 			w.c.metrics.overloaded.Inc()
 			return WorkerStatusOverloaded
-		} else if uint(batchSize) <= w.c.config.MaximumBatchSize/minimumBatchSizeDivider {
+		} else if uint(batchSize) <= primaryConfig.MaximumBatchSize/minimumBatchSizeDivider {
 			w.c.metrics.underloaded.Inc()
 			return WorkerStatusUnderloaded
 		}
@@ -115,74 +139,137 @@ func (w *realWorker) Flush(ctx context.Context) {
 	if w.bf.FlowCount() == 0 {
 		return
 	}
-	// Async mode if have not a big batch size
-	var settings []ch.Setting
-	if uint(w.bf.FlowCount()) <= w.c.config.MaximumBatchSize/minimumBatchSizeDivider {
-		settings = w.asyncSettings
+
+	// Write to all destinations in parallel
+	// NOTE: We use a plain errgroup (not WithContext) so that failures in one
+	// destination don't cancel the context for other destinations. Each destination
+	// has independent retry limits and should fail independently.
+	g := new(errgroup.Group)
+
+	for _, dw := range w.destWriters {
+		dw := dw // Capture for goroutine
+		g.Go(func() error {
+			return w.flushSingleDestination(ctx, dw)
+		})
 	}
 
-	// We try to send as long as possible. The only exit condition is an
-	// expiration of the context.
+	// Wait for all destinations to complete
+	// We don't return the error because we want to clear the batch regardless
+	if err := g.Wait(); err != nil {
+		w.logger.Err(err).Msg("one or more destinations failed")
+	}
+
+	// Clear batch after all destinations have been attempted
+	w.bf.Clear()
+}
+
+// flushSingleDestination sends data to a single ClickHouse destination with retry logic
+func (w *realWorker) flushSingleDestination(ctx context.Context, dw *destinationWriter) error {
+	// Async mode if have not a big batch size
+	var settings []ch.Setting
+	if uint(w.bf.FlowCount()) <= dw.config.MaximumBatchSize/minimumBatchSizeDivider {
+		settings = dw.asyncSettings
+	}
+
+	// Retry with backoff and max attempts
 	b := backoff.NewExponentialBackOff()
 	b.MaxElapsedTime = 0
 	b.MaxInterval = 30 * time.Second
 	b.InitialInterval = 20 * time.Millisecond
-	backoff.Retry(func() error {
-		// Connect or reconnect if connection is broken.
-		if err := w.connect(ctx); err != nil {
-			w.logger.Err(err).Msg("cannot connect to ClickHouse")
+
+	attempts := 0
+	maxAttempts := dw.maxRetries
+	if maxAttempts == 0 {
+		maxAttempts = -1 // Infinite retries
+	}
+
+	return backoff.Retry(func() error {
+		attempts++
+
+		// Check if we've exceeded max retries
+		if maxAttempts > 0 && attempts > maxAttempts {
+			err := fmt.Errorf("max retries (%d) exceeded for destination %q", maxAttempts, dw.name)
+			w.logger.Err(err).
+				Str("destination", dw.name).
+				Int("attempts", attempts).
+				Msg("giving up on destination")
+			w.c.metrics.retriesExceeded.WithLabelValues(dw.name).Inc()
+			return backoff.Permanent(err) // Stop retrying
+		}
+
+		// Connect or reconnect if connection is broken
+		if err := w.connectDestination(ctx, dw); err != nil {
+			w.logger.Err(err).
+				Str("destination", dw.name).
+				Int("attempt", attempts).
+				Msg("cannot connect to ClickHouse")
+			w.c.metrics.errors.WithLabelValues(dw.name, "connect").Inc()
 			return err
 		}
 
-		// Send to ClickHouse in flows_XXXXX_raw.
+		// Send to ClickHouse in flows_XXXXX_raw
 		start := time.Now()
-		if err := w.conn.Do(ctx, ch.Query{
+		if err := dw.conn.Do(ctx, ch.Query{
 			Body:     w.bf.ClickHouseProtoInput().Into(fmt.Sprintf("flows_%s_raw", w.c.d.Schema.ClickHouseHash())),
 			Input:    w.bf.ClickHouseProtoInput(),
 			Settings: settings,
 		}); err != nil {
-			w.logger.Err(err).Int("flows", w.bf.FlowCount()).Msg("cannot send batch to ClickHouse")
-			w.c.metrics.errors.WithLabelValues("send").Inc()
+			w.logger.Err(err).
+				Str("destination", dw.name).
+				Int("flows", w.bf.FlowCount()).
+				Int("attempt", attempts).
+				Msg("cannot send batch to ClickHouse")
+			w.c.metrics.errors.WithLabelValues(dw.name, "send").Inc()
+
+			// Close connection on error
+			if dw.conn != nil {
+				dw.conn.Close()
+				dw.conn = nil
+			}
 			return err
 		}
-		pushDuration := time.Since(start)
-		w.c.metrics.insertTime.Observe(pushDuration.Seconds())
-		w.c.metrics.flows.Observe(float64(w.bf.FlowCount()))
 
-		// Clear batch
-		w.bf.Clear()
+		// Success - record metrics
+		pushDuration := time.Since(start)
+		w.c.metrics.insertTime.WithLabelValues(dw.name).Observe(pushDuration.Seconds())
+		w.c.metrics.flows.WithLabelValues(dw.name).Observe(float64(w.bf.FlowCount()))
+
 		return nil
 	}, backoff.WithContext(b, ctx))
 }
 
-// connect establishes or reestablish the connection to ClickHouse.
-func (w *realWorker) connect(ctx context.Context) error {
+// connectDestination establishes or reestablishes the connection to a ClickHouse destination.
+func (w *realWorker) connectDestination(ctx context.Context, dw *destinationWriter) error {
 	// If connection exists and is healthy, reuse it
-	if w.conn != nil {
-		if err := w.conn.Ping(ctx); err == nil {
+	if dw.conn != nil {
+		if err := dw.conn.Ping(ctx); err == nil {
 			return nil
 		}
 		// Connection is unhealthy, close it
-		w.conn.Close()
-		w.conn = nil
+		dw.conn.Close()
+		dw.conn = nil
 	}
 
 	// Try each server until one connects successfully
 	var lastErr error
-	for _, idx := range rand.Perm(len(w.servers)) {
-		w.options.Address = w.servers[idx]
-		conn, err := ch.Dial(ctx, w.options)
+	for _, idx := range rand.Perm(len(dw.servers)) {
+		dw.options.Address = dw.servers[idx]
+		conn, err := ch.Dial(ctx, dw.options)
 		if err != nil {
-			w.logger.Err(err).Str("server", w.options.Address).Msg("failed to connect to ClickHouse server")
-			w.c.metrics.errors.WithLabelValues("connect").Inc()
+			w.logger.Err(err).
+				Str("destination", dw.name).
+				Str("server", dw.options.Address).
+				Msg("failed to connect to ClickHouse server")
 			lastErr = err
 			continue
 		}
 
 		// Test the connection
 		if err := conn.Ping(ctx); err != nil {
-			w.logger.Err(err).Str("server", w.options.Address).Msg("ClickHouse server ping failed")
-			w.c.metrics.errors.WithLabelValues("ping").Inc()
+			w.logger.Err(err).
+				Str("destination", dw.name).
+				Str("server", dw.options.Address).
+				Msg("ClickHouse server ping failed")
 			conn.Close()
 			conn = nil
 			lastErr = err
@@ -190,8 +277,11 @@ func (w *realWorker) connect(ctx context.Context) error {
 		}
 
 		// Success
-		w.conn = conn
-		w.logger.Info().Str("server", w.options.Address).Msg("connected to ClickHouse server")
+		dw.conn = conn
+		w.logger.Info().
+			Str("destination", dw.name).
+			Str("server", dw.options.Address).
+			Msg("connected to ClickHouse server")
 		return nil
 	}
 

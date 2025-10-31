@@ -29,6 +29,10 @@ type Configuration struct {
 	MaxOpenConns int `validate:"min=1"`
 	// DialTimeout tells how much time to wait when connecting to ClickHouse
 	DialTimeout time.Duration `validate:"min=100ms"`
+	// MaxRetries tells how many times to retry failed operations.
+	// 0 means infinite retries (default for primary destination).
+	// For additional destinations, set to a positive number (e.g., 3).
+	MaxRetries int `validate:"min=0"`
 	// TLS defines TLS connection parameters, if empty, plain TCP will be used.
 	TLS helpers.TLSConfiguration
 }
@@ -56,6 +60,11 @@ func (c *Component) ClusterName() string {
 // DatabaseName returns the database we operate on.
 func (c *Component) DatabaseName() string {
 	return c.config.Database
+}
+
+// MaxRetries returns the maximum number of retries for this connection.
+func (c *Component) MaxRetries() int {
+	return c.config.MaxRetries
 }
 
 // ChGoOptions returns options suitable to use with ch-go and the list of

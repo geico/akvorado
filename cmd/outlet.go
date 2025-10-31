@@ -27,17 +27,31 @@ import (
 	"akvorado/outlet/routing/provider/bmp"
 )
 
+// DataDestination represents a ClickHouse destination for flow data
+type DataDestination struct {
+	// Name is a friendly name for this destination (e.g., "azure", "backup", "primary")
+	Name string `validate:"required"`
+	// Connection defines the ClickHouse connection parameters
+	Connection clickhousedb.Configuration
+	// ClickHouse defines outlet-specific parameters (overrides default if set)
+	ClickHouse *clickhouse.Configuration
+}
+
 // OutletConfiguration represents the configuration file for the outlet command.
 type OutletConfiguration struct {
-	Reporting    reporter.Configuration
-	HTTP         httpserver.Configuration
-	Metadata     metadata.Configuration
-	Routing      routing.Configuration
-	Kafka        kafka.Configuration
+	Reporting reporter.Configuration
+	HTTP      httpserver.Configuration
+	Metadata  metadata.Configuration
+	Routing   routing.Configuration
+	Kafka     kafka.Configuration
+	// Default ClickHouse behavior settings (applied to all destinations unless overridden)
+	ClickHouse clickhouse.Configuration
+	// Primary destination (backward compatible) - becomes first destination if set
 	ClickHouseDB clickhousedb.Configuration
-	ClickHouse   clickhouse.Configuration
-	Core         core.Configuration
-	Schema       schema.Configuration
+	// Additional data destinations with optional per-destination overrides
+	DataDestinations []DataDestination `validate:"dive"`
+	Core             core.Configuration
+	Schema           schema.Configuration
 }
 
 // Reset resets the configuration for the outlet command to its default value.
@@ -135,15 +149,49 @@ func outletStart(r *reporter.Reporter, config OutletConfiguration, checkOnly boo
 	if err != nil {
 		return fmt.Errorf("unable to initialize Kafka component: %w", err)
 	}
-	clickhouseDBComponent, err := clickhousedb.New(r, config.ClickHouseDB, clickhousedb.Dependencies{
-		Daemon: daemonComponent,
-	})
-	if err != nil {
-		return fmt.Errorf("unable to initialize ClickHouse component: %w", err)
+	// Normalize destinations: build list from primary + additional destinations
+	var destinations []clickhouse.DestinationDependency
+
+	// Add primary destination if ClickHouseDB is configured (backward compatible)
+	if len(config.ClickHouseDB.Servers) > 0 {
+		primaryDB, err := clickhousedb.New(r, config.ClickHouseDB, clickhousedb.Dependencies{
+			Daemon: daemonComponent,
+		})
+		if err != nil {
+			return fmt.Errorf("unable to initialize primary ClickHouse DB component: %w", err)
+		}
+		destinations = append(destinations, clickhouse.DestinationDependency{
+			Name:       "primary",
+			ClickHouse: primaryDB,
+			Config:     config.ClickHouse, // Use default config
+		})
 	}
-	clickhouseComponent, err := clickhouse.New(r, config.ClickHouse, clickhouse.Dependencies{
-		ClickHouse: clickhouseDBComponent,
-		Schema:     schemaComponent,
+
+	// Add additional destinations
+	for _, dest := range config.DataDestinations {
+		destDB, err := clickhousedb.New(r, dest.Connection, clickhousedb.Dependencies{
+			Daemon: daemonComponent,
+		})
+		if err != nil {
+			return fmt.Errorf("unable to initialize ClickHouse DB component %q: %w", dest.Name, err)
+		}
+
+		// Use destination-specific config if provided, otherwise use default
+		destConfig := config.ClickHouse
+		if dest.ClickHouse != nil {
+			destConfig = *dest.ClickHouse
+		}
+
+		destinations = append(destinations, clickhouse.DestinationDependency{
+			Name:       dest.Name,
+			ClickHouse: destDB,
+			Config:     destConfig,
+		})
+	}
+
+	clickhouseComponent, err := clickhouse.New(r, clickhouse.Dependencies{
+		Schema:       schemaComponent,
+		Destinations: destinations,
 	})
 	if err != nil {
 		return fmt.Errorf("unable to initialize outlet ClickHouse component: %w", err)
@@ -174,7 +222,6 @@ func outletStart(r *reporter.Reporter, config OutletConfiguration, checkOnly boo
 	// Start all the components.
 	components := []any{
 		httpComponent,
-		clickhouseDBComponent,
 		clickhouseComponent,
 		flowComponent,
 		metadataComponent,
