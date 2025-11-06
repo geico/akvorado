@@ -700,29 +700,16 @@ Example for a remote datacenter orchestrator (manages only its local ClickHouse)
 ```yaml
 orchestrator:
   kafka:
-    manage-topic: false  # Kafka managed by primary datacenter
-    # Note: brokers/topic still required but not used (dummy values OK)
-    brokers: ["dummy"]
+    manage-topic: false  # Kafka topic managed by primary datacenter
+    brokers: ["kafka-primary:9092"]  # Connect to shared Kafka
     topic: flows
   clickhouse:
-    manage-schema: true  # Manage local ClickHouse schema
     resolutions:
       - interval: 0
         ttl: 360h
 ```
 
-Example for outlet-only orchestrator (manages nothing):
-
-```yaml
-orchestrator:
-  kafka:
-    manage-topic: false
-    # Dummy values - not used when manage-topic is false
-    brokers: ["dummy"]
-    topic: flows
-  clickhouse:
-    manage-schema: false  # Schema managed by dedicated orchestrator
-```
+Note: Each orchestrator always manages the ClickHouse instance it's connected to. Secondary ClickHouse destinations (configured in outlet's `data-destinations`) must have their own orchestrator instance.
 
 See the [orchestrator configuration](#clickhouse-1) section for more details.
 
@@ -974,7 +961,6 @@ configure a ClickHouse database. It also provisions and keep
 up-to-date a ClickHouse database. The following keys can be
 provided inside `clickhouse`:
 
-- `manage-schema` controls whether the orchestrator should create/update ClickHouse tables (default: `true`)
 - `resolutions` defines the various resolutions to keep data
 - `max-partitions` defines the number of partitions to use when
   creating consolidated tables
@@ -983,20 +969,7 @@ provided inside `clickhouse`:
   `SrcNetRole`, `DstNetRole`, etc. It is also possible to override GeoIP
   attributes `city`, `state`, `country`, and `ASN`.
 
-**Schema management:**
-
-Set `manage-schema: false` when the ClickHouse schema is managed externally or by
-another orchestrator instance. This is useful when:
-
-- Using multiple ClickHouse destinations (each with its own orchestrator)
-- The schema is managed by a dedicated orchestrator instance
-- You want manual control over schema migrations
-
-```yaml
-clickhouse:
-  manage-schema: false  # Don't create/update tables
-  # Note: resolutions are ignored when manage-schema is false
-```
+**Note:** Each orchestrator always manages the ClickHouse instance it's connected to (creates/updates tables, manages schema). If you're using dual-write to multiple ClickHouse destinations, each destination must have its own orchestrator instance.
 - `network-sources` fetch a remote source mapping subnets to attributes. This is
   similar to `networks` but the definition is fetched through HTTP. It accepts a
   map from source names to sources. Each source accepts the following

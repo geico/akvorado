@@ -16,9 +16,6 @@ import (
 
 // Configuration describes the configuration for the ClickHouse configurator.
 type Configuration struct {
-	// ManageSchema tells if we should manage the ClickHouse schema (create/update tables).
-	// Set to false when the schema is managed externally or by another orchestrator.
-	ManageSchema bool
 	// SkipMigrations tell if we should skip migrations.
 	SkipMigrations bool
 	// Resolutions describe the various resolutions to use to
@@ -70,7 +67,6 @@ type ResolutionConfiguration struct {
 // DefaultConfiguration represents the default configuration for the ClickHouse configurator.
 func DefaultConfiguration() Configuration {
 	return Configuration{
-		ManageSchema: true, // Manage schema by default (backward compatible)
 		Resolutions: []ResolutionConfiguration{
 			{0, 15 * 24 * time.Hour},                   // 15 days
 			{time.Minute, 7 * 24 * time.Hour},          // 7 days

@@ -48,31 +48,20 @@ Implemented **Option 4: Unified data-destinations with defaults** for dual-write
 
 ### Orchestrator Management Flags
 
-#### `orchestrator/kafka/config.go`
+#### `orchestrator/kafka/config.go` + `root.go`
 **Changes:**
 - Added `ManageTopic bool` field (default: `true`)
 - Updated `DefaultConfiguration()` to set `ManageTopic: true`
-- **Note:** Brokers/topic still required for validation but can use dummy values (e.g., `["dummy"]`)
-
-#### `orchestrator/kafka/root.go`
-**Changes:**
 - Added check for `config.ManageTopic` in `New()` method to skip Kafka initialization entirely
 - If `ManageTopic` is `false`, skips `kafka.NewConfig()` call (no Kafka validation/connection)
 - Added check for `c.config.ManageTopic` in `Start()` method
 - Skips topic creation/update if `ManageTopic` is `false`
 - Logs "Kafka topic management disabled, skipping Kafka initialization" in `New()`
 - Logs "Kafka topic management disabled, skipping" in `Start()`
-- **Benefit:** Remote orchestrators without Kafka access can now run without any Kafka interaction
 
-#### `orchestrator/clickhouse/config.go`
-**Changes:**
-- Added `ManageSchema bool` field (default: `true`)
-- Updated `DefaultConfiguration()` to set `ManageSchema: true`
+**Use case:** When multiple datacenters share one Kafka cluster, only one orchestrator should manage the topic (primary DC). Remote orchestrators set `manage-topic: false`.
 
-#### `orchestrator/clickhouse/migrations.go`
-**Changes:**
-- Added check for `c.config.ManageSchema` in `migrateDatabase()` method
-- Skips all schema migrations if `ManageSchema` is `false`
+**Note:** Each orchestrator always manages the ClickHouse instance it's connected to. Secondary ClickHouse destinations (in `data-destinations`) must have their own orchestrator instance.
 
 ### Retry Configuration
 
@@ -103,11 +92,6 @@ Implemented **Option 4: Unified data-destinations with defaults** for dual-write
 - Tests for `ManageTopic` flag (true/false)
 - Tests for default value (true)
 
-#### `orchestrator/clickhouse/config_dualwrite_test.go`
-**Changes:**
-- Tests for `ManageSchema` flag (true/false)
-- Tests for default value (true)
-
 #### `common/clickhousedb/config_dualwrite_test.go`
 **Changes:**
 - Tests for `MaxRetries` configuration (0, 3, 5)
@@ -123,7 +107,6 @@ Implemented **Option 4: Unified data-destinations with defaults** for dual-write
 - Documented default ClickHouse settings and per-destination overrides
 - Documented `max-retries` behavior in ClickHouse database section
 - Documented `manage-topic` flag in Kafka section
-- Documented `manage-schema` flag in ClickHouse section
 - Added cross-references between sections
 
 ## Configuration Examples
